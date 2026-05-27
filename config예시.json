@@ -1,0 +1,8 @@
+{
+    "TARGET_CHANNEL_ID": "여기에_치지직_32자리_채널_해시값_입력",
+    "CHZZK_CLIENT_ID": "발급받은_치지직_공식_CLIENT_ID",
+    "CHZZK_CLIENT_SECRET": "발급받은_치지직_공식_CLIENT_SECRET",
+    "GEMINI_API_KEY": "발급받은_구글_GEMINI_API_KEY",
+    "NID_AUT": "네이버_개발자도구에서_복사한_NID_AUT_값",
+    "NID_SES": "네이버_개발자도구에서_복사한_NID_SES_값"
+}
