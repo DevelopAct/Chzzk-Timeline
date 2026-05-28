@@ -84,7 +84,6 @@ def select_chzzk_vod(channel_id):
                 
                 print(f"\n🎯 [선택 완료] {video_title} 작업을 시작합니다.")
                 
-                # 💡 기존 메인 로직과 unpack 개수를 맞추기 위해 정확히 3개만 반환합니다.
                 return full_vod_url, video_title, video_duration
             else:
                 print(f"❌ 0부터 {len(vod_list)-1} 사이의 번호를 입력해주세요.")

@@ -158,15 +158,13 @@ def run_pure_test():
     cleaned_final_lines.insert(0, ai_notice)
 
     final_timeline = "\n".join(cleaned_final_lines)
-    output_path = f"TL_{vod_id}_{int(start_percent)}_{int(end_percent)}.txt"
+    output_path = f"TL_VOD_{vod_id}_{int(start_percent)}_{int(end_percent)}.txt"
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_timeline)
 
-    # 🎯 [최종 후처리 자동 연동]: 저장이 끝난 후 공백 정렬기를 자동으로 즉시 실행합니다.
     repair_final_timeline_layout(output_path)
 
-    # 완벽하게 정렬 완료된 최적화 파일 다시 불러오기
     with open(output_path, "r", encoding="utf-8") as f:
         final_printed_timeline = f.read()
 

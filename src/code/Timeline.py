@@ -4,9 +4,13 @@ import json
 import warnings
 import subprocess
 import re
+import time
 from yt_dlp import YoutubeDL
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -15,6 +19,17 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 TEMPERATURE = 0.1  
 MAX_OUTPUT_TOKENS = 4000             
 TOP_P = 0.95                          
+
+class TimelineItem(BaseModel):
+    group_large: str = Field(description="상황이 속한 큰 사건 대분류 (예: 저스트 채팅, 게임 방송, 공지사항 등)")
+    group_small: str = Field(description="상황이 속한 세부 주제 (예: 시청자 티키타카, 룰 세팅, 오버워치 합방 등)")
+    timestamp: str = Field(description="[HH:MM:SS] 또는 [MM:SS] 형태의 타임스탬프 시간")
+    wf: int = Field(description="재미 점수 (0 ~ 50점)")
+    wi: int = Field(description="중요 점수 (0 ~ 50점)")
+    content: str = Field(description="방송 중 일어난 상황에 대한 명사형 요약 내용")
+
+class TimelineResponse(BaseModel):
+    items: List[TimelineItem] = Field(description="추출된 타임라인 아이템 목록")
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -130,7 +145,7 @@ def download_chzzk_vod_audio(chzzk_url, vod_id, start_percent=0.0, end_percent=1
 
     return final_chunk_mp3
 
-def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="base"):
+def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="turbo"):
     print(f"\n🎙️ 2단계: Faster-Whisper AI 엔진 구동 ({model_size}) - 대본 추출 및 시간 복원 중...")
     
     if not os.path.exists(audio_path):
@@ -142,7 +157,15 @@ def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="bas
     
     try:
         from faster_whisper import WhisperModel
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        try:
+            print("⚡ 외장 GPU 가속(CUDA) 가동을 시도합니다...")
+            model = WhisperModel(model_size, device="cuda", compute_type="float16")
+            print("🚀 [GPU 가속 성공] NVIDIA CUDA 백엔드로 초고속 STT 연산을 시작합니다.")
+        except Exception as gpu_error:
+            print(f"⚠️ GPU 로드 실패 ({gpu_error}). 안전하게 CPU 모드로 전환합니다.")
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            print("🐌 [CPU 전환 완료] CPU 환경에서 대본 추출을 진행합니다.")
+            
     except ImportError:
         print("❌ faster-whisper 라이브러리가 설치되어 있지 않습니다.")
         return ""
@@ -179,56 +202,12 @@ def transcribe_chzzk_audio(audio_path, chzzk_url, start_percent, model_size="bas
     print(f"✅ 원본 오프셋이 복원된 생대본 추출 완료! (보존 경로: {script_cache_path})")
     return raw_script
 
-def filter_timeline_by_score(timeline_result):
-    final_lines = []
-    current_group_tag = None
-    group_contents = []
-    
-    raw_lines = timeline_result.split('\n')
-    
-    for line in raw_lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        if line.startswith("[") and ";" in line and line.endswith("]"):
-            if current_group_tag and group_contents:
-                if final_lines: 
-                    final_lines.append("") 
-                final_lines.append(current_group_tag)
-                final_lines.extend(group_contents)
-            
-            current_group_tag = line  
-            group_contents = []
-            continue
-            
-        match = re.search(r"재미:(\d+),\s*중요:(\d+)", line)
-        if match:
-            wf, wi = int(match.group(1)), int(match.group(2))
-            wt = (wf + wi) / 100
-            step = max(1, min(10, round(wt * 10)))
-            
-            if step >= 6 or wi >= 40:
-                clean_line = re.sub(r"\(재미:\d+,\s*중요:\d+\)", "", line).strip()
-                if current_group_tag:
-                    group_contents.append(clean_line)
-                else:
-                    final_lines.append(clean_line)
-                    
-    if current_group_tag and group_contents:
-        if final_lines: 
-            final_lines.append("")
-        final_lines.append(current_group_tag)
-        final_lines.extend(group_contents)
-        
-    return "\n".join(final_lines)
-
 def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url="", api_key=""):
     try:
         with open("prompt.txt", "r", encoding="utf-8") as f:
             system_instruction = f.read()
     except:
-        system_instruction = "당신은 VOD 편집자입니다. 대본을 분석하여 사건과 상황을 타임라인 형식으로 요약하세요."
+        system_instruction = "당신은 VOD 편집자입니다. 대본을 분석하여 사건하고 상황을 타임라인 형식으로 요약하세요."
 
     streamer_info_content = ""
     if os.path.exists("streamer_info.txt"):
@@ -240,60 +219,126 @@ def generate_chzzk_timeline(raw_script, actual_title="VOD제목", chzzk_url="", 
         except Exception as e:
             print(f"⚠️ 'streamer_info.txt' 파일을 읽는 중 오류 발생: {e}")
 
-    formatting_constraint = (
-        "\n\n🚨 [추가 필독 엄격 제약사양]\n"
-        "출력 시 '[대분류;소주제]' 규격의 그룹 헤더 태그와 타임스탬프 기반 요약 행을 제외하고, "
-        "마크다운 강조(**)나 기타 불필요한 공백 텍스트는 생성하지 마세요."
-    )
+    clean_script_text = raw_script.replace(" ", "").replace("\n", "")
+    script_lines_count = len([l for l in raw_script.split("\n") if l.strip()])
+    
+    dynamic_density_hint = ""
+    if script_lines_count > 0:
+        avg_chars_per_line = len(clean_script_text) / script_lines_count
+        if avg_chars_per_line >= 16.0 or script_lines_count >= 150:
+            dynamic_density_hint = (
+                "\n\n[💡 AI 편집기 통계 신호 안내]\n"
+                "- 현재 구간 특징: 단위 시간당 대사 전환 빈도가 높고 발화 밀도가 매우 촘촘합니다.\n"
+                "- 분석 가이드: 여러 사람이 대화를 나누는 '합방/디코 소통'이거나, 오디오가 쉬지 않고 채워지는 '외부 영상 시청' 상태일 확률이 극도로 높습니다. "
+                "주인공 스트리머가 대화에 실시간으로 끼어들어 양방향 상호작용을 하는지, 아니면 배경 음성을 가만히 들으며 혼자 리액션하는지 문맥을 엄격히 구별해 타임라인을 도출하십시오."
+            )
+        else:
+            dynamic_density_hint = (
+                "\n\n[💡 AI 편집기 통계 신호 안내]\n"
+                "- 현재 구간 특징: 발화 간격이 여유롭고 단독 오디오 위주로 구성되어 있습니다.\n"
+                "- 분석 가이드: 주인공 스트리머 혼자 방송을 이끌어가는 '단독 저스트 채팅/소통'이거나, 오디오가 빈번하게 비는 잔잔한 게임 구간일 확률이 높습니다. "
+                "독백 및 시청자 피드백을 중심으로 깔끔하게 상황을 요약하십시오."
+            )
 
     if streamer_info_content:
-        combined_instruction = f"{system_instruction}\n\n{streamer_info_content}\n\n{formatting_constraint}"
+        combined_instruction = f"{system_instruction}\n\n{streamer_info_content}"
     else:
-        combined_instruction = f"{system_instruction}\n\n{formatting_constraint}"
+        combined_instruction = f"{system_instruction}"
 
-    print(f"\n✨ 3단계: Gemini AI 기반 타임라인 가공 중 (방송인 컨텍스트 및 그룹 태깅 적용)...")
+    input_content = f"{dynamic_density_hint}\n\n분석 대상 스크립트:\n{raw_script}"
+
+    print(f"\n✨ 3단계: Gemini AI 기반 타임라인 가공 중 (Response Schema 연동 구조)...")
+    
+    max_retries = 5
+    retry_delay = 10
+    response_json_text = ""
+
+    for attempt in range(max_retries):
+        try:
+            time.sleep(2.0)
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=input_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=combined_instruction,
+                    temperature=TEMPERATURE,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    top_p=TOP_P,
+                    response_mime_type="application/json",
+                    response_schema=TimelineResponse,
+                )
+            )
+            response_json_text = response.text.strip()
+            if response_json_text:
+                time.sleep(2.0)
+                break
+        except Exception as e:
+            err_msg = str(e)
+            is_quota_error = any(x in err_msg for x in ["429", "RESOURCE_EXHAUSTED", "quota", "limit", "exceeded"])
+            is_server_error = any(x in err_msg for x in ["503", "UNAVAILABLE", "internal", "server"])
+            
+            if is_quota_error:
+                print(f"⚠️ [Gemini 할당량 한도 도달] 429 RESOURCE_EXHAUSTED 예외 방어 기동. 안전 잠금을 해제하기 위해 {retry_delay}초간 제어 대기합니다... (시도: {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay = min(120, retry_delay * 2)
+                continue
+            elif is_server_error:
+                print(f"⚠️ [Gemini 서버 과부하 상태] 일시적인 503 과부하 신호 감지. {retry_delay}초 후 처리를 재시도합니다... (시도: {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay = min(120, retry_delay * 2)
+                continue
+            else:
+                print(f"❌ Gemini API 연산 중 일반 예외 필터링 차단: {e}")
+                return ""
+
+    if not response_json_text:
+        print("❌ [구간 스킵 안내] 설정된 자동 최대 재시도 임계값 내에 할당량 잠금이 해제되지 않아 본 청크 분석을 안전하게 건너뜁니다.")
+        return ""
+
+    print("🛠️ 4단계: 타임라인 구조적 점수 필터링 및 그룹 빌드 중...")
+    print("🛠️ 5단계: 타임라인 최종 안전 필터링 및 찌꺼기 후처리 정제 중...")
     
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=f"분석 대상 스크립트:\n{raw_script}",
-            config=types.GenerateContentConfig(
-                system_instruction=combined_instruction,
-                temperature=TEMPERATURE,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-                top_p=TOP_P
-            )
-        )
-        timeline_result = response.text.strip()
-    except Exception as e:
-        print(f"\n❌ Gemini API 실행 오류: {e}")
+        data = json.loads(response_json_text)
+        items = data.get("items", [])
+        
+        final_output_lines = []
+        current_header = None
+        current_group_lines = []
+        
+        for item in items:
+            gl = item.get("group_large", "").strip()
+            gs = item.get("group_small", "").strip()
+            ts = item.get("timestamp", "").strip()
+            wf = item.get("wf", 0)
+            wi = item.get("wi", 0)
+            content = item.get("content", "").strip()
+            
+            wt = wf + wi
+            step = max(1, min(10, round((wt / 100) * 10)))
+            
+            if step >= 4 or wi >= 40:
+                header_tag = f"[{gl};{gs}]"
+                
+                if current_header != header_tag:
+                    if current_header and current_group_lines:
+                        final_output_lines.append(current_header)
+                        final_output_lines.extend(current_group_lines)
+                        final_output_lines.append("")
+                    current_header = header_tag
+                    current_group_lines = []
+                
+                cleaned_content = re.sub(r"\s*\(\s*\d+\s*단계\s*\)\s*", " ", content).strip()
+                cleaned_content = re.sub(r"^\s*\(\s*\d+\s*단계\s*\)\s*", "", cleaned_content).strip()
+                
+                current_group_lines.append(f"{ts} {cleaned_content}")
+                
+        if current_header and current_group_lines:
+            final_output_lines.append(current_header)
+            final_output_lines.extend(current_group_lines)
+            
+        return "\n".join(final_output_lines)
+    except Exception as parse_error:
+        print(f"❌ JSON 스키마 파싱 실패: {parse_error}")
         return ""
-            
-    print("🛠️ 4단계: 타임라인 점수 필터링 및 그룹 빌드 중...")
-    filtered_timeline = filter_timeline_by_score(timeline_result)
-    
-    print("🛠️ 5단계: 타임라인 최종 안전 필터링 및 찌꺼기 후처리 정제 중...")
-    timeline_lines = [line.strip() for line in filtered_timeline.split('\n') if line.strip()]
-    cleaned_lines = []
-    
-    timestamp_pattern = re.compile(r"^\[?\d{1,2}:\d{2}(?::\d{2})?\]?")
-
-    for line in timeline_lines:
-        line = re.sub(r"\s*\|\|\s*step:\d+", "", line).strip()
-        if not line:
-            continue
-        
-        line = re.sub(r"^[-*+•\s]+", "", line).strip()
-        
-        if line.startswith("[") and ";" in line and line.endswith("]"):
-            cleaned_lines.append(line)
-            continue
-            
-        if "🤖 이 댓글은" in line or line.startswith("[00:00:00]"):
-            continue
-        
-        if timestamp_pattern.match(line):
-            cleaned_lines.append(line)
-            
-    return "\n".join(cleaned_lines)
